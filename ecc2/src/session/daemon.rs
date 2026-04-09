@@ -33,6 +33,14 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
             tracing::error!("Backlog coordination pass failed: {e}");
         }
 
+        if let Err(e) = maybe_auto_merge_ready_worktrees(&db, &cfg).await {
+            tracing::error!("Worktree auto-merge pass failed: {e}");
+        }
+
+        if let Err(e) = maybe_auto_prune_inactive_worktrees(&db).await {
+            tracing::error!("Worktree auto-prune pass failed: {e}");
+        }
+
         time::sleep(heartbeat_interval).await;
     }
 }
@@ -97,15 +105,19 @@ fn check_sessions(db: &StateStore, timeout: Duration) -> Result<()> {
 }
 
 async fn maybe_auto_dispatch(db: &StateStore, cfg: &Config) -> Result<usize> {
-    let summary = maybe_auto_dispatch_with_recorder(cfg, || {
-        manager::auto_dispatch_backlog(
-            db,
-            cfg,
-            &cfg.default_agent,
-            true,
-            cfg.max_parallel_sessions,
-        )
-    }, |routed, deferred, leads| db.record_daemon_dispatch_pass(routed, deferred, leads))
+    let summary = maybe_auto_dispatch_with_recorder(
+        cfg,
+        || {
+            manager::auto_dispatch_backlog(
+                db,
+                cfg,
+                &cfg.default_agent,
+                true,
+                cfg.max_parallel_sessions,
+            )
+        },
+        |routed, deferred, leads| db.record_daemon_dispatch_pass(routed, deferred, leads),
+    )
     .await?;
     Ok(summary.routed)
 }
@@ -116,26 +128,34 @@ async fn coordinate_backlog_cycle(db: &StateStore, cfg: &Config) -> Result<()> {
         cfg,
         &activity,
         || {
-            maybe_auto_dispatch_with_recorder(cfg, || {
-                manager::auto_dispatch_backlog(
-                    db,
-                    cfg,
-                    &cfg.default_agent,
-                    true,
-                    cfg.max_parallel_sessions,
-                )
-            }, |routed, deferred, leads| db.record_daemon_dispatch_pass(routed, deferred, leads))
+            maybe_auto_dispatch_with_recorder(
+                cfg,
+                || {
+                    manager::auto_dispatch_backlog(
+                        db,
+                        cfg,
+                        &cfg.default_agent,
+                        true,
+                        cfg.max_parallel_sessions,
+                    )
+                },
+                |routed, deferred, leads| db.record_daemon_dispatch_pass(routed, deferred, leads),
+            )
         },
         || {
-            maybe_auto_rebalance_with_recorder(cfg, || {
-                manager::rebalance_all_teams(
-                    db,
-                    cfg,
-                    &cfg.default_agent,
-                    true,
-                    cfg.max_parallel_sessions,
-                )
-            }, |rerouted, leads| db.record_daemon_rebalance_pass(rerouted, leads))
+            maybe_auto_rebalance_with_recorder(
+                cfg,
+                || {
+                    manager::rebalance_all_teams(
+                        db,
+                        cfg,
+                        &cfg.default_agent,
+                        true,
+                        cfg.max_parallel_sessions,
+                    )
+                },
+                |rerouted, leads| db.record_daemon_rebalance_pass(rerouted, leads),
+            )
         },
         |routed, leads| db.record_daemon_recovery_dispatch_pass(routed, leads),
     )
@@ -163,7 +183,11 @@ where
             tracing::warn!(
                 "Skipping immediate dispatch retry because chronic saturation cooloff is active"
             );
-            return Ok((DispatchPassSummary::default(), rebalanced, DispatchPassSummary::default()));
+            return Ok((
+                DispatchPassSummary::default(),
+                rebalanced,
+                DispatchPassSummary::default(),
+            ));
         }
         let first_dispatch = dispatch().await?;
         if first_dispatch.routed > 0 {
@@ -206,7 +230,11 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<Vec<manager::LeadDispatchOutcome>>>,
 {
-    Ok(maybe_auto_dispatch_with_recorder(cfg, dispatch, |_, _, _| Ok(())).await?.routed)
+    Ok(
+        maybe_auto_dispatch_with_recorder(cfg, dispatch, |_, _, _| Ok(()))
+            .await?
+            .routed,
+    )
 }
 
 async fn maybe_auto_dispatch_with_recorder<F, Fut, R>(
@@ -254,9 +282,7 @@ where
         );
     }
     if deferred > 0 {
-        tracing::warn!(
-            "Deferred {deferred} task handoff(s) because delegate teams were saturated"
-        );
+        tracing::warn!("Deferred {deferred} task handoff(s) because delegate teams were saturated");
     }
 
     Ok(DispatchPassSummary {
@@ -267,15 +293,19 @@ where
 }
 
 async fn maybe_auto_rebalance(db: &StateStore, cfg: &Config) -> Result<usize> {
-    maybe_auto_rebalance_with_recorder(cfg, || {
-        manager::rebalance_all_teams(
-            db,
-            cfg,
-            &cfg.default_agent,
-            true,
-            cfg.max_parallel_sessions,
-        )
-    }, |rerouted, leads| db.record_daemon_rebalance_pass(rerouted, leads))
+    maybe_auto_rebalance_with_recorder(
+        cfg,
+        || {
+            manager::rebalance_all_teams(
+                db,
+                cfg,
+                &cfg.default_agent,
+                true,
+                cfg.max_parallel_sessions,
+            )
+        },
+        |rerouted, leads| db.record_daemon_rebalance_pass(rerouted, leads),
+    )
     .await
 }
 
@@ -313,6 +343,109 @@ where
     }
 
     Ok(rerouted)
+}
+
+async fn maybe_auto_merge_ready_worktrees(db: &StateStore, cfg: &Config) -> Result<usize> {
+    maybe_auto_merge_ready_worktrees_with_recorder(
+        cfg,
+        || manager::merge_ready_worktrees(db, true),
+        |merged, active, conflicted, dirty, failed| {
+            db.record_daemon_auto_merge_pass(merged, active, conflicted, dirty, failed)
+        },
+    )
+    .await
+}
+
+async fn maybe_auto_merge_ready_worktrees_with<F, Fut>(cfg: &Config, merge: F) -> Result<usize>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<manager::WorktreeBulkMergeOutcome>>,
+{
+    maybe_auto_merge_ready_worktrees_with_recorder(cfg, merge, |_, _, _, _, _| Ok(())).await
+}
+
+async fn maybe_auto_merge_ready_worktrees_with_recorder<F, Fut, R>(
+    cfg: &Config,
+    merge: F,
+    mut record: R,
+) -> Result<usize>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<manager::WorktreeBulkMergeOutcome>>,
+    R: FnMut(usize, usize, usize, usize, usize) -> Result<()>,
+{
+    if !cfg.auto_merge_ready_worktrees {
+        return Ok(0);
+    }
+
+    let outcome = merge().await?;
+    let merged = outcome.merged.len();
+    let active = outcome.active_with_worktree_ids.len();
+    let conflicted = outcome.conflicted_session_ids.len();
+    let dirty = outcome.dirty_worktree_ids.len();
+    let failed = outcome.failures.len();
+    record(merged, active, conflicted, dirty, failed)?;
+
+    if merged > 0 {
+        tracing::info!("Auto-merged {merged} ready worktree(s)");
+    }
+    if conflicted > 0 {
+        tracing::warn!(
+            "Skipped {} conflicted worktree(s) during auto-merge",
+            conflicted
+        );
+    }
+    if dirty > 0 {
+        tracing::warn!("Skipped {} dirty worktree(s) during auto-merge", dirty);
+    }
+    if active > 0 {
+        tracing::info!("Skipped {active} active worktree(s) during auto-merge");
+    }
+    if failed > 0 {
+        tracing::warn!("Auto-merge failed for {failed} worktree(s)");
+    }
+
+    Ok(merged)
+}
+
+async fn maybe_auto_prune_inactive_worktrees(db: &StateStore) -> Result<usize> {
+    maybe_auto_prune_inactive_worktrees_with_recorder(
+        || manager::prune_inactive_worktrees(db),
+        |pruned, active| db.record_daemon_auto_prune_pass(pruned, active),
+    )
+    .await
+}
+
+async fn maybe_auto_prune_inactive_worktrees_with<F, Fut>(prune: F) -> Result<usize>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<manager::WorktreePruneOutcome>>,
+{
+    maybe_auto_prune_inactive_worktrees_with_recorder(prune, |_, _| Ok(())).await
+}
+
+async fn maybe_auto_prune_inactive_worktrees_with_recorder<F, Fut, R>(
+    prune: F,
+    mut record: R,
+) -> Result<usize>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<manager::WorktreePruneOutcome>>,
+    R: FnMut(usize, usize) -> Result<()>,
+{
+    let outcome = prune().await?;
+    let pruned = outcome.cleaned_session_ids.len();
+    let active = outcome.active_with_worktree_ids.len();
+    record(pruned, active)?;
+
+    if pruned > 0 {
+        tracing::info!("Auto-pruned {pruned} inactive worktree(s)");
+    }
+    if active > 0 {
+        tracing::info!("Skipped {active} active worktree(s) during auto-prune");
+    }
+
+    Ok(pruned)
 }
 
 #[cfg(unix)]
@@ -528,7 +661,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_backlog_cycle_retries_after_rebalance_when_dispatch_deferred() -> Result<()> {
+    async fn coordinate_backlog_cycle_retries_after_rebalance_when_dispatch_deferred() -> Result<()>
+    {
         let cfg = Config {
             auto_dispatch_unread_handoffs: true,
             ..Config::default()
@@ -607,7 +741,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_backlog_cycle_records_recovery_dispatch_when_it_routes_work() -> Result<()> {
+    async fn coordinate_backlog_cycle_records_recovery_dispatch_when_it_routes_work() -> Result<()>
+    {
         let cfg = Config {
             auto_dispatch_unread_handoffs: true,
             ..Config::default()
@@ -653,7 +788,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_backlog_cycle_rebalances_first_after_unrecovered_deferred_pressure() -> Result<()> {
+    async fn coordinate_backlog_cycle_rebalances_first_after_unrecovered_deferred_pressure(
+    ) -> Result<()> {
         let cfg = Config {
             auto_dispatch_unread_handoffs: true,
             ..Config::default()
@@ -664,12 +800,22 @@ mod tests {
             last_dispatch_routed: 0,
             last_dispatch_deferred: 2,
             last_dispatch_leads: 1,
+            chronic_saturation_streak: 1,
             last_recovery_dispatch_at: None,
             last_recovery_dispatch_routed: 0,
             last_recovery_dispatch_leads: 0,
             last_rebalance_at: None,
             last_rebalance_rerouted: 0,
             last_rebalance_leads: 0,
+            last_auto_merge_at: None,
+            last_auto_merge_merged: 0,
+            last_auto_merge_active_skipped: 0,
+            last_auto_merge_conflicted_skipped: 0,
+            last_auto_merge_dirty_skipped: 0,
+            last_auto_merge_failed: 0,
+            last_auto_prune_at: None,
+            last_auto_prune_pruned: 0,
+            last_auto_prune_active_skipped: 0,
         };
         let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let dispatch_order = order.clone();
@@ -708,7 +854,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_backlog_cycle_records_recovery_when_rebalance_first_dispatch_routes_work() -> Result<()> {
+    async fn coordinate_backlog_cycle_records_recovery_when_rebalance_first_dispatch_routes_work(
+    ) -> Result<()> {
         let cfg = Config {
             auto_dispatch_unread_handoffs: true,
             ..Config::default()
@@ -719,12 +866,22 @@ mod tests {
             last_dispatch_routed: 0,
             last_dispatch_deferred: 2,
             last_dispatch_leads: 1,
+            chronic_saturation_streak: 1,
             last_recovery_dispatch_at: None,
             last_recovery_dispatch_routed: 0,
             last_recovery_dispatch_leads: 0,
             last_rebalance_at: None,
             last_rebalance_rerouted: 0,
             last_rebalance_leads: 0,
+            last_auto_merge_at: None,
+            last_auto_merge_merged: 0,
+            last_auto_merge_active_skipped: 0,
+            last_auto_merge_conflicted_skipped: 0,
+            last_auto_merge_dirty_skipped: 0,
+            last_auto_merge_failed: 0,
+            last_auto_prune_at: None,
+            last_auto_prune_pruned: 0,
+            last_auto_prune_active_skipped: 0,
         };
         let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
         let recorded_clone = recorded.clone();
@@ -755,7 +912,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_backlog_cycle_skips_dispatch_during_chronic_cooloff_when_rebalance_does_not_help() -> Result<()> {
+    async fn coordinate_backlog_cycle_skips_dispatch_during_chronic_cooloff_when_rebalance_does_not_help(
+    ) -> Result<()> {
         let cfg = Config {
             auto_dispatch_unread_handoffs: true,
             ..Config::default()
@@ -766,12 +924,22 @@ mod tests {
             last_dispatch_routed: 0,
             last_dispatch_deferred: 3,
             last_dispatch_leads: 1,
+            chronic_saturation_streak: 1,
             last_recovery_dispatch_at: None,
             last_recovery_dispatch_routed: 0,
             last_recovery_dispatch_leads: 0,
             last_rebalance_at: Some(now - chrono::Duration::seconds(1)),
             last_rebalance_rerouted: 0,
             last_rebalance_leads: 1,
+            last_auto_merge_at: None,
+            last_auto_merge_merged: 0,
+            last_auto_merge_active_skipped: 0,
+            last_auto_merge_conflicted_skipped: 0,
+            last_auto_merge_dirty_skipped: 0,
+            last_auto_merge_failed: 0,
+            last_auto_prune_at: None,
+            last_auto_prune_pruned: 0,
+            last_auto_prune_active_skipped: 0,
         };
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_clone = calls.clone();
@@ -803,7 +971,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinate_backlog_cycle_skips_rebalance_when_stabilized_and_dispatch_is_healthy() -> Result<()> {
+    async fn coordinate_backlog_cycle_skips_dispatch_when_persistent_saturation_streak_hits_cooloff(
+    ) -> Result<()> {
+        let cfg = Config {
+            auto_dispatch_unread_handoffs: true,
+            ..Config::default()
+        };
+        let now = chrono::Utc::now();
+        let activity = DaemonActivity {
+            last_dispatch_at: Some(now),
+            last_dispatch_routed: 0,
+            last_dispatch_deferred: 1,
+            last_dispatch_leads: 1,
+            chronic_saturation_streak: 3,
+            last_recovery_dispatch_at: None,
+            last_recovery_dispatch_routed: 0,
+            last_recovery_dispatch_leads: 0,
+            last_rebalance_at: Some(now - chrono::Duration::seconds(1)),
+            last_rebalance_rerouted: 0,
+            last_rebalance_leads: 1,
+            last_auto_merge_at: None,
+            last_auto_merge_merged: 0,
+            last_auto_merge_active_skipped: 0,
+            last_auto_merge_conflicted_skipped: 0,
+            last_auto_merge_dirty_skipped: 0,
+            last_auto_merge_failed: 0,
+            last_auto_prune_at: None,
+            last_auto_prune_pruned: 0,
+            last_auto_prune_active_skipped: 0,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+
+        let (first, rebalanced, recovery) = coordinate_backlog_cycle_with(
+            &cfg,
+            &activity,
+            move || {
+                let calls_clone = calls_clone.clone();
+                async move {
+                    calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(DispatchPassSummary {
+                        routed: 1,
+                        deferred: 0,
+                        leads: 1,
+                    })
+                }
+            },
+            || async move { Ok(0) },
+            |_, _| Ok(()),
+        )
+        .await?;
+
+        assert_eq!(first, DispatchPassSummary::default());
+        assert_eq!(rebalanced, 0);
+        assert_eq!(recovery, DispatchPassSummary::default());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn coordinate_backlog_cycle_skips_rebalance_when_stabilized_and_dispatch_is_healthy(
+    ) -> Result<()> {
         let cfg = Config {
             auto_dispatch_unread_handoffs: true,
             ..Config::default()
@@ -814,12 +1042,22 @@ mod tests {
             last_dispatch_routed: 2,
             last_dispatch_deferred: 0,
             last_dispatch_leads: 1,
+            chronic_saturation_streak: 0,
             last_recovery_dispatch_at: Some(now + chrono::Duration::seconds(1)),
             last_recovery_dispatch_routed: 1,
             last_recovery_dispatch_leads: 1,
             last_rebalance_at: Some(now),
             last_rebalance_rerouted: 1,
             last_rebalance_leads: 1,
+            last_auto_merge_at: None,
+            last_auto_merge_merged: 0,
+            last_auto_merge_active_skipped: 0,
+            last_auto_merge_conflicted_skipped: 0,
+            last_auto_merge_dirty_skipped: 0,
+            last_auto_merge_failed: 0,
+            last_auto_prune_at: None,
+            last_auto_prune_pruned: 0,
+            last_auto_prune_active_skipped: 0,
         };
         let rebalance_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rebalance_calls_clone = rebalance_calls.clone();
@@ -955,6 +1193,93 @@ mod tests {
         assert_eq!(rerouted, 1);
         assert_eq!(*recorded.lock().unwrap(), Some((1, 1)));
         let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_merge_ready_worktrees_noops_when_disabled() -> Result<()> {
+        let mut cfg = Config::default();
+        cfg.auto_merge_ready_worktrees = false;
+
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invoked_flag = invoked.clone();
+
+        let merged = maybe_auto_merge_ready_worktrees_with(&cfg, move || {
+            let invoked_flag = invoked_flag.clone();
+            async move {
+                invoked_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(manager::WorktreeBulkMergeOutcome {
+                    merged: Vec::new(),
+                    active_with_worktree_ids: Vec::new(),
+                    conflicted_session_ids: Vec::new(),
+                    dirty_worktree_ids: Vec::new(),
+                    failures: Vec::new(),
+                })
+            }
+        })
+        .await?;
+
+        assert_eq!(merged, 0);
+        assert!(!invoked.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_merge_ready_worktrees_merges_ready_worktrees_when_enabled() -> Result<()> {
+        let mut cfg = Config::default();
+        cfg.auto_merge_ready_worktrees = true;
+
+        let merged = maybe_auto_merge_ready_worktrees_with(&cfg, || async move {
+            Ok(manager::WorktreeBulkMergeOutcome {
+                merged: vec![
+                    manager::WorktreeMergeOutcome {
+                        session_id: "worker-a".to_string(),
+                        branch: "ecc/worker-a".to_string(),
+                        base_branch: "main".to_string(),
+                        already_up_to_date: false,
+                        cleaned_worktree: true,
+                    },
+                    manager::WorktreeMergeOutcome {
+                        session_id: "worker-b".to_string(),
+                        branch: "ecc/worker-b".to_string(),
+                        base_branch: "main".to_string(),
+                        already_up_to_date: true,
+                        cleaned_worktree: true,
+                    },
+                ],
+                active_with_worktree_ids: vec!["worker-c".to_string()],
+                conflicted_session_ids: vec!["worker-d".to_string()],
+                dirty_worktree_ids: vec!["worker-e".to_string()],
+                failures: Vec::new(),
+            })
+        })
+        .await?;
+
+        assert_eq!(merged, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maybe_auto_prune_inactive_worktrees_records_pruned_and_active_counts() -> Result<()> {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded_clone = recorded.clone();
+
+        let pruned = maybe_auto_prune_inactive_worktrees_with_recorder(
+            || async move {
+                Ok(manager::WorktreePruneOutcome {
+                    cleaned_session_ids: vec!["stopped-a".to_string(), "stopped-b".to_string()],
+                    active_with_worktree_ids: vec!["running-a".to_string()],
+                })
+            },
+            move |pruned, active| {
+                *recorded_clone.lock().unwrap() = Some((pruned, active));
+                Ok(())
+            },
+        )
+        .await?;
+
+        assert_eq!(pruned, 2);
+        assert_eq!(*recorded.lock().unwrap(), Some((2, 1)));
         Ok(())
     }
 }
