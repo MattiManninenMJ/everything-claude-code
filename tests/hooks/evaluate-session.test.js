@@ -4,6 +4,10 @@
  * Tests the session evaluation threshold logic, config loading,
  * and stdin parsing. Uses temporary JSONL transcript files.
  *
+ * Config override: Tests that need a custom config file pass
+ * ECC_EVALUATE_CONFIG via the extraEnv parameter to runEvaluate()
+ * instead of mutating the real skills/continuous-learning/config.json.
+ *
  * Run with: node tests/hooks/evaluate-session.test.js
  */
 
@@ -57,11 +61,12 @@ function createTranscript(dir, messageCount) {
  * Uses spawnSync to capture both stdout and stderr regardless of exit code.
  * Returns { code, stdout, stderr }.
  */
-function runEvaluate(stdinJson) {
+function runEvaluate(stdinJson, extraEnv) {
   const result = spawnSync('node', [evaluateScript], {
     encoding: 'utf8',
     input: JSON.stringify(stdinJson),
     timeout: 10000,
+    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
   });
   return {
     code: result.status || 0,
@@ -315,100 +320,61 @@ function runTests() {
   console.log('\nRound 85: config parse error catch block:');
 
   if (test('falls back to defaults when config file contains invalid JSON', () => {
-    // The evaluate-session.js script reads config from:
-    //   path.join(__dirname, '..', '..', 'skills', 'continuous-learning', 'config.json')
-    // where __dirname = scripts/hooks/ → config = repo_root/skills/continuous-learning/config.json
-    const configPath = path.join(__dirname, '..', '..', 'skills', 'continuous-learning', 'config.json');
-    let originalContent = null;
-    try {
-      originalContent = fs.readFileSync(configPath, 'utf8');
-    } catch {
-      // Config file may not exist — that's fine
-    }
+    // Use a temp file for corrupt config via ECC_EVALUATE_CONFIG env var
+    // instead of mutating the real skills/continuous-learning/config.json
+    const testDir = createTestDir();
+    const configPath = path.join(testDir, 'config.json');
+    fs.writeFileSync(configPath, 'NOT VALID JSON {{{ corrupt data !!!', 'utf8');
 
-    try {
-      // Write corrupt JSON to the config file
-      fs.writeFileSync(configPath, 'NOT VALID JSON {{{ corrupt data !!!', 'utf8');
+    // Create a transcript with 12 user messages (above default threshold of 10)
+    const transcript = createTranscript(testDir, 12);
+    const result = runEvaluate({ transcript_path: transcript }, { ECC_EVALUATE_CONFIG: configPath });
 
-      // Create a transcript with 12 user messages (above default threshold of 10)
-      const testDir = createTestDir();
-      const transcript = createTranscript(testDir, 12);
-      const result = runEvaluate({ transcript_path: transcript });
+    assert.strictEqual(result.code, 0, 'Should exit 0 despite corrupt config');
+    // With corrupt config, defaults apply: min_session_length = 10
+    // 12 >= 10 → should evaluate (not "too short")
+    assert.ok(!result.stderr.includes('too short'),
+      `Should NOT say too short — corrupt config falls back to default min=10. Got: ${result.stderr}`);
+    assert.ok(
+      result.stderr.includes('12 messages') || result.stderr.includes('evaluate'),
+      `Should evaluate with 12 messages using default threshold. Got: ${result.stderr}`
+    );
+    // The catch block logs "Failed to parse config" — verify that log message
+    assert.ok(result.stderr.includes('Failed to parse config'),
+      `Should log config parse error. Got: ${result.stderr}`);
 
-      assert.strictEqual(result.code, 0, 'Should exit 0 despite corrupt config');
-      // With corrupt config, defaults apply: min_session_length = 10
-      // 12 >= 10 → should evaluate (not "too short")
-      assert.ok(!result.stderr.includes('too short'),
-        `Should NOT say too short — corrupt config falls back to default min=10. Got: ${result.stderr}`);
-      assert.ok(
-        result.stderr.includes('12 messages') || result.stderr.includes('evaluate'),
-        `Should evaluate with 12 messages using default threshold. Got: ${result.stderr}`
-      );
-      // The catch block logs "Failed to parse config" — verify that log message
-      assert.ok(result.stderr.includes('Failed to parse config'),
-        `Should log config parse error. Got: ${result.stderr}`);
-
-      cleanupTestDir(testDir);
-    } finally {
-      // Restore original config file
-      if (originalContent !== null) {
-        fs.writeFileSync(configPath, originalContent, 'utf8');
-      } else {
-        // Config didn't exist before — remove the corrupt one we created
-        try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
-      }
-    }
+    cleanupTestDir(testDir);
   })) passed++; else failed++;
 
   // ── Round 86: config learned_skills_path override with ~ expansion ──
   console.log('\nRound 86: config learned_skills_path override:');
 
   if (test('uses learned_skills_path from config with ~ expansion', () => {
-    // evaluate-session.js lines 69-72:
-    //   if (config.learned_skills_path) {
-    //     learnedSkillsPath = config.learned_skills_path.replace(/^~/, require('os').homedir());
-    //   }
-    // This branch was never tested — only the parse error (Round 85) and default path.
-    const configPath = path.join(__dirname, '..', '..', 'skills', 'continuous-learning', 'config.json');
-    let originalContent = null;
-    try {
-      originalContent = fs.readFileSync(configPath, 'utf8');
-    } catch {
-      // Config file may not exist
-    }
+    // Use a temp file for config via ECC_EVALUATE_CONFIG env var
+    // instead of mutating the real skills/continuous-learning/config.json
+    const testDir = createTestDir();
+    const configPath = path.join(testDir, 'config.json');
+    fs.writeFileSync(configPath, JSON.stringify({
+      min_session_length: 10,
+      learned_skills_path: '~/custom-learned-skills-dir'
+    }));
 
-    try {
-      // Write config with a custom learned_skills_path using ~ prefix
-      fs.writeFileSync(configPath, JSON.stringify({
-        min_session_length: 10,
-        learned_skills_path: '~/custom-learned-skills-dir'
-      }));
+    // Create a transcript with 12 user messages (above threshold)
+    const transcript = createTranscript(testDir, 12);
+    const result = runEvaluate({ transcript_path: transcript }, { ECC_EVALUATE_CONFIG: configPath });
 
-      // Create a transcript with 12 user messages (above threshold)
-      const testDir = createTestDir();
-      const transcript = createTranscript(testDir, 12);
-      const result = runEvaluate({ transcript_path: transcript });
+    assert.strictEqual(result.code, 0, 'Should exit 0');
+    // The script logs "Save learned skills to: <path>" where <path> should
+    // be the expanded home directory, NOT the literal "~"
+    assert.ok(!result.stderr.includes('~/custom-learned-skills-dir'),
+      'Should NOT contain literal ~ in output (should be expanded)');
+    assert.ok(result.stderr.includes('custom-learned-skills-dir'),
+      `Should reference the custom learned skills dir. Got: ${result.stderr}`);
+    // The ~ should have been replaced with os.homedir()
+    assert.ok(result.stderr.includes(os.homedir()),
+      `Should contain expanded home directory. Got: ${result.stderr}`);
 
-      assert.strictEqual(result.code, 0, 'Should exit 0');
-      // The script logs "Save learned skills to: <path>" where <path> should
-      // be the expanded home directory, NOT the literal "~"
-      assert.ok(!result.stderr.includes('~/custom-learned-skills-dir'),
-        'Should NOT contain literal ~ in output (should be expanded)');
-      assert.ok(result.stderr.includes('custom-learned-skills-dir'),
-        `Should reference the custom learned skills dir. Got: ${result.stderr}`);
-      // The ~ should have been replaced with os.homedir()
-      assert.ok(result.stderr.includes(os.homedir()),
-        `Should contain expanded home directory. Got: ${result.stderr}`);
-
-      cleanupTestDir(testDir);
-    } finally {
-      // Restore original config file
-      if (originalContent !== null) {
-        fs.writeFileSync(configPath, originalContent, 'utf8');
-      } else {
-        try { fs.unlinkSync(configPath); } catch { /* best-effort */ }
-      }
-    }
+    cleanupTestDir(testDir);
   })) passed++; else failed++;
 
   // Summary

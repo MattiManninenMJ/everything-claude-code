@@ -52,9 +52,9 @@ async function main() {
     transcriptPath = process.env.CLAUDE_TRANSCRIPT_PATH;
   }
 
-  // Get script directory to find config
-  const scriptDir = __dirname;
-  const configFile = path.join(scriptDir, '..', '..', 'skills', 'continuous-learning', 'config.json');
+  // Get script directory to find config (ECC_EVALUATE_CONFIG overrides for testing)
+  const configFile = process.env.ECC_EVALUATE_CONFIG
+    || path.join(__dirname, '..', '..', 'skills', 'continuous-learning', 'config.json');
 
   // Default configuration
   let minSessionLength = 10;
